@@ -22,19 +22,25 @@ is_valid_repository() {
     [[ "$1" != *..* ]] && [[ "$1" != */ ]]
 }
 
+is_valid_digest() {
+  [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
 is_valid_positive_integer() {
   [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 > 0))
 }
 
-[[ $# -eq 2 ]] || die "Usage: deploy.sh IMAGE_REPOSITORY GITHUB_SHA"
+[[ $# -eq 3 ]] || die "Usage: deploy.sh IMAGE_REPOSITORY GITHUB_SHA IMAGE_DIGEST"
 
 IMAGE_REPOSITORY=$1
 GITHUB_SHA=$2
+IMAGE_DIGEST=$3
 IMAGE_TAG="sha-${GITHUB_SHA}"
-EXPECTED_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+EXPECTED_IMAGE="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
 is_valid_repository "$IMAGE_REPOSITORY" || die "IMAGE_REPOSITORY must be a lowercase ghcr.io repository."
 [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || die "GITHUB_SHA must be a full lowercase commit SHA."
+is_valid_digest "$IMAGE_DIGEST" || die "IMAGE_DIGEST must be a lowercase SHA-256 OCI digest."
 [[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "COMPOSE_PROJECT_NAME is invalid."
 is_valid_positive_integer "$HEALTH_ATTEMPTS" || die "DEPLOY_HEALTH_ATTEMPTS must be positive."
 is_valid_positive_integer "$HEALTH_INTERVAL" || die "DEPLOY_HEALTH_INTERVAL must be positive."
@@ -52,6 +58,7 @@ docker network inspect "$PROXY_NETWORK" >/dev/null 2>&1 || die "Required externa
 
 LAST_GOOD_IMAGE_REPOSITORY=""
 LAST_GOOD_IMAGE_TAG=""
+LAST_GOOD_IMAGE_DIGEST=""
 LAST_GOOD_PROJECT_NAME=""
 
 if [[ -f "$LAST_GOOD_ENV_FILE" ]]; then
@@ -59,6 +66,7 @@ if [[ -f "$LAST_GOOD_ENV_FILE" ]]; then
     case "$key" in
       IMAGE_REPOSITORY) LAST_GOOD_IMAGE_REPOSITORY=$value ;;
       IMAGE_TAG) LAST_GOOD_IMAGE_TAG=$value ;;
+      IMAGE_DIGEST) LAST_GOOD_IMAGE_DIGEST=$value ;;
       COMPOSE_PROJECT_NAME) LAST_GOOD_PROJECT_NAME=$value ;;
     esac
   done < "$LAST_GOOD_ENV_FILE"
@@ -68,7 +76,8 @@ ROLLBACK_AVAILABLE=0
 if is_valid_repository "$LAST_GOOD_IMAGE_REPOSITORY" &&
   [[ "$LAST_GOOD_IMAGE_REPOSITORY" == "$IMAGE_REPOSITORY" ]] &&
   [[ "$LAST_GOOD_IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ ]] &&
-  [[ "$LAST_GOOD_IMAGE_TAG" != "$IMAGE_TAG" ]] &&
+  is_valid_digest "$LAST_GOOD_IMAGE_DIGEST" &&
+  [[ "$LAST_GOOD_IMAGE_DIGEST" != "$IMAGE_DIGEST" ]] &&
   [[ "$LAST_GOOD_PROJECT_NAME" == "$PROJECT_NAME" ]]; then
   ROLLBACK_AVAILABLE=1
 fi
@@ -77,17 +86,49 @@ write_env() {
   local target=$1
   local repository=$2
   local tag=$3
-  local project=$4
+  local digest=$4
+  local project=$5
   local next="${target}.next"
 
   {
     printf 'COMPOSE_PROJECT_NAME=%s\n' "$project"
     printf 'IMAGE_REPOSITORY=%s\n' "$repository"
     printf 'IMAGE_TAG=%s\n' "$tag"
+    printf 'IMAGE_DIGEST=%s\n' "$digest"
   } > "$next"
   chmod 600 "$next"
   mv -f -- "$next" "$target"
 }
+
+migrate_legacy_last_good() {
+  local ids config_image image_id repo_digests repo_digest digest="" matches=0
+  [[ -z "$LAST_GOOD_IMAGE_DIGEST" ]] || return 0
+  is_valid_repository "$LAST_GOOD_IMAGE_REPOSITORY" &&
+    [[ "$LAST_GOOD_IMAGE_REPOSITORY" == "$IMAGE_REPOSITORY" ]] &&
+    [[ "$LAST_GOOD_IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ ]] &&
+    [[ "$LAST_GOOD_PROJECT_NAME" == "$PROJECT_NAME" ]] || return 0
+  mapfile -t ids < <(docker ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${SERVICE_NAME}" --format '{{.ID}}')
+  ((${#ids[@]} == 1)) || die "Legacy last-good migration requires exactly one running Compose service container."
+  config_image=$(docker inspect --format '{{.Config.Image}}' "${ids[0]}") || die "Cannot inspect the deployed container image."
+  [[ "$config_image" == "${LAST_GOOD_IMAGE_REPOSITORY}:${LAST_GOOD_IMAGE_TAG}" ]] || die "The deployed container does not match legacy last-good state."
+  image_id=$(docker inspect --format '{{.Image}}' "${ids[0]}") || die "Cannot resolve the deployed image ID."
+  is_valid_digest "$image_id" || die "The deployed container has an invalid image ID."
+  repo_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image_id") || die "Cannot inspect deployed image digests."
+  while IFS= read -r repo_digest; do
+    [[ "${repo_digest%@*}" == "$LAST_GOOD_IMAGE_REPOSITORY" ]] || continue
+    digest=${repo_digest#*@}
+    is_valid_digest "$digest" || die "The deployed image has an invalid repository digest."
+    matches=$((matches + 1))
+  done <<< "$repo_digests"
+  ((matches == 1)) || die "Legacy last-good migration requires exactly one matching repository digest."
+  write_env "$LAST_GOOD_ENV_FILE" "$LAST_GOOD_IMAGE_REPOSITORY" "$LAST_GOOD_IMAGE_TAG" "$digest" "$LAST_GOOD_PROJECT_NAME" || die "Cannot persist migrated last-good state."
+  LAST_GOOD_IMAGE_DIGEST=$digest
+  ROLLBACK_AVAILABLE=0
+  [[ "$digest" == "$IMAGE_DIGEST" ]] || ROLLBACK_AVAILABLE=1
+}
+
+migrate_legacy_last_good
 
 compose() {
   docker compose \
@@ -138,12 +179,13 @@ show_diagnostics() {
 }
 
 rollback() {
-  local last_good_image="${LAST_GOOD_IMAGE_REPOSITORY}:${LAST_GOOD_IMAGE_TAG}"
+  local last_good_image="${LAST_GOOD_IMAGE_REPOSITORY}@${LAST_GOOD_IMAGE_DIGEST}"
 
   write_env \
     "$ENV_FILE" \
     "$LAST_GOOD_IMAGE_REPOSITORY" \
     "$LAST_GOOD_IMAGE_TAG" \
+    "$LAST_GOOD_IMAGE_DIGEST" \
     "$LAST_GOOD_PROJECT_NAME" || return 1
   compose pull "$SERVICE_NAME" || return 1
   compose up -d "$SERVICE_NAME" || return 1
@@ -161,7 +203,7 @@ handle_failure() {
   show_diagnostics
 
   if ((ROLLBACK_AVAILABLE)); then
-    printf '%s\n' 'Attempting rollback to the previous immutable tag.' >&2
+    printf '%s\n' 'Attempting rollback to the previous immutable digest.' >&2
     if rollback; then
       printf '%s\n' 'Rollback succeeded; the deployment still returns failure.' >&2
     else
@@ -169,7 +211,7 @@ handle_failure() {
       show_diagnostics
     fi
   else
-    printf '%s\n' 'No valid previous immutable tag is available for rollback.' >&2
+    printf '%s\n' 'No valid previous immutable digest is available for rollback.' >&2
   fi
 
   exit 1
@@ -177,7 +219,7 @@ handle_failure() {
 
 trap 'status=$?; line=$LINENO; handle_failure "unexpected error at line ${line} (exit ${status})"' ERR
 
-write_env "$ENV_FILE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$PROJECT_NAME"
+write_env "$ENV_FILE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$IMAGE_DIGEST" "$PROJECT_NAME"
 
 if ! compose pull "$SERVICE_NAME"; then
   handle_failure "unable to pull the requested image"
@@ -192,12 +234,12 @@ if ! wait_for_health; then
 fi
 
 if ! verify_image "$EXPECTED_IMAGE"; then
-  handle_failure "the running container image does not match the requested immutable tag"
+  handle_failure "the running container image does not match the requested immutable digest"
 fi
 
 if ! compose ps "$SERVICE_NAME"; then
   handle_failure "unable to confirm the Compose service state"
 fi
 
-write_env "$LAST_GOOD_ENV_FILE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$PROJECT_NAME"
+write_env "$LAST_GOOD_ENV_FILE" "$IMAGE_REPOSITORY" "$IMAGE_TAG" "$IMAGE_DIGEST" "$PROJECT_NAME"
 printf 'Deployment succeeded with image %s.\n' "$EXPECTED_IMAGE"

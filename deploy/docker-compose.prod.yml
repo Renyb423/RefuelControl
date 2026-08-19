@@ -2,7 +2,7 @@ name: "${COMPOSE_PROJECT_NAME:-refuel-control}"
 
 services:
   refuelcontrol-web:
-    image: "${IMAGE_REPOSITORY:?IMAGE_REPOSITORY is required}:${IMAGE_TAG:?IMAGE_TAG is required}"
+    image: "${IMAGE_REPOSITORY:?IMAGE_REPOSITORY is required}@${IMAGE_DIGEST:?IMAGE_DIGEST is required}"
     restart: unless-stopped
     networks:
       - proxy_net
