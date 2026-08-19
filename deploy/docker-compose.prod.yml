@@ -1,0 +1,39 @@
+name: "${COMPOSE_PROJECT_NAME:-refuel-control}"
+
+services:
+  refuelcontrol-web:
+    image: "${IMAGE_REPOSITORY:?IMAGE_REPOSITORY is required}:${IMAGE_TAG:?IMAGE_TAG is required}"
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: proxy_net
+      traefik.http.routers.refuelcontrol-web.rule: "Host(`refuelcontrol.fetek.es`)"
+      traefik.http.routers.refuelcontrol-web.entrypoints: websecure
+      traefik.http.routers.refuelcontrol-web.tls: "true"
+      traefik.http.routers.refuelcontrol-web.tls.certresolver: dev_resolver
+      traefik.http.routers.refuelcontrol-web.service: refuelcontrol-web
+      traefik.http.services.refuelcontrol-web.loadbalancer.server.port: "8080"
+      traefik.http.services.refuelcontrol-web.loadbalancer.healthcheck.path: /healthz
+      traefik.http.services.refuelcontrol-web.loadbalancer.healthcheck.interval: 10s
+      traefik.http.services.refuelcontrol-web.loadbalancer.healthcheck.timeout: 3s
+    user: "101:101"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+networks:
+  proxy_net:
+    external: true
+    name: proxy_net

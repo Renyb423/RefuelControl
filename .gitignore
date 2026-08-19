@@ -47,3 +47,11 @@ Thumbs.db
 .env
 src/environments/environment.ts
 
+# Local tool state
+/.atl/
+/.codegraph/
+
+# Deployment runtime state
+/deploy/.env
+/deploy/.env.*
+!/deploy/.env.example

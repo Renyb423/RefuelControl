@@ -1,0 +1,226 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: refuel-control-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main for manual deployments
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          DEPLOY_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_REF" == "refs/heads/main" ]] || {
+            printf '%s\n' 'Manual production deployments are allowed only from refs/heads/main.' >&2
+            exit 1
+          }
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Validate and normalize configuration
+        id: config
+        shell: bash
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          REPOSITORY: ${{ github.repository }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SUPABASE_KEY: ${{ vars.SUPABASE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+        run: |
+          set -euo pipefail
+
+          repository=$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image_repository="ghcr.io/${repository}"
+          package_name=${repository#*/}
+
+          [[ "$repository" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]]
+          [[ -n "$SUPABASE_URL" && "$SUPABASE_URL" == https://* ]]
+          [[ -n "$SUPABASE_KEY" ]]
+          node <<'NODE'
+          const key = process.env.SUPABASE_KEY;
+          if (key.startsWith('sb_publishable_')) {
+            process.exit(0);
+          }
+
+          try {
+            const parts = key.split('.');
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            process.exit(parts.length === 3 && payload.role === 'anon' ? 0 : 1);
+          } catch {
+            process.exit(1);
+          }
+          NODE
+          [[ -n "$SSH_HOST" && "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ -n "$SSH_USER" && "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]+$ && "$SSH_PORT" -ge 1 && "$SSH_PORT" -le 65535 ]]
+          [[ -n "$SSH_KNOWN_HOSTS" ]]
+          [[ -n "$SSH_PRIVATE_KEY" ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_PATH" != *..* ]]
+
+          printf 'image_repository=%s\n' "$image_repository" >> "$GITHUB_OUTPUT"
+          printf 'package_name=%s\n' "$package_name" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and run tests
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: test
+          push: false
+          cache-from: type=gha,scope=refuel-control
+          cache-to: type=gha,mode=max,scope=refuel-control
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.config.outputs.image_repository }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=raw,value=latest
+
+      - name: Build and push production image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          secrets: |
+            supabase_url=${{ vars.SUPABASE_URL }}
+            supabase_key=${{ vars.SUPABASE_KEY }}
+          no-cache-filters: build
+          cache-from: type=gha,scope=refuel-control
+          cache-to: type=gha,mode=max,scope=refuel-control
+
+      - name: Prepare strict SSH configuration
+        shell: bash
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          install -m 700 -d "$RUNNER_TEMP/refuel-control-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/refuel-control-ssh/id"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/refuel-control-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/refuel-control-ssh/id" "$RUNNER_TEMP/refuel-control-ssh/known_hosts"
+
+          lookup_host=$SSH_HOST
+          if [[ "$SSH_PORT" != "22" ]]; then
+            lookup_host="[${SSH_HOST}]:${SSH_PORT}"
+          fi
+          ssh-keygen -F "$lookup_host" -f "$RUNNER_TEMP/refuel-control-ssh/known_hosts" >/dev/null
+
+      - name: Copy deployment manifests
+        shell: bash
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+
+          key_file="$RUNNER_TEMP/refuel-control-ssh/id"
+          known_hosts_file="$RUNNER_TEMP/refuel-control-ssh/known_hosts"
+          remote="${SSH_USER}@${SSH_HOST}"
+
+          ssh -i "$key_file" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            "$remote" "mkdir -p -- '$DEPLOY_PATH'"
+          scp -i "$key_file" -P "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            deploy/docker-compose.prod.yml deploy/deploy.sh "$remote:${DEPLOY_PATH}/"
+          ssh -i "$key_file" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            "$remote" "chmod 700 '$DEPLOY_PATH/deploy.sh'"
+
+      - name: Deploy immutable image
+        shell: bash
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          GITHUB_SHA: ${{ github.sha }}
+          IMAGE_REPOSITORY: ${{ steps.config.outputs.image_repository }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+
+          key_file="$RUNNER_TEMP/refuel-control-ssh/id"
+          known_hosts_file="$RUNNER_TEMP/refuel-control-ssh/known_hosts"
+          remote="${SSH_USER}@${SSH_HOST}"
+
+          ssh -i "$key_file" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            "$remote" "COMPOSE_PROJECT_NAME=refuel-control bash '$DEPLOY_PATH/deploy.sh' '$IMAGE_REPOSITORY' '$GITHUB_SHA'"
+
+      - name: Verify public HTTPS routing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url='https://refuelcontrol.fetek.es'
+          curl_options=(
+            --fail
+            --silent
+            --show-error
+            --location
+            --retry 5
+            --retry-all-errors
+            --retry-delay 3
+            --retry-connrefused
+            --retry-max-time 60
+            --connect-timeout 10
+            --max-time 20
+          )
+
+          health_response=$(curl "${curl_options[@]}" "${base_url}/healthz")
+          [[ "$health_response" == "ok" ]] || {
+            printf '%s\n' 'Public health check returned an unexpected response.' >&2
+            exit 1
+          }
+
+          root_response=$(curl "${curl_options[@]}" "${base_url}/")
+          [[ "$root_response" == *'<app-root></app-root>'* ]] || {
+            printf '%s\n' 'Public root response does not contain the expected Angular shell.' >&2
+            exit 1
+          }
+
+      - name: Retain the latest four package versions
+        if: ${{ success() }}
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          package-name: ${{ steps.config.outputs.package_name }}
+          package-type: container
+          min-versions-to-keep: 4
+          token: ${{ github.token }}
