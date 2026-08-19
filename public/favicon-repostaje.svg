@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Cuerpo del surtidor -->
+  <rect x="12" y="8" width="30" height="48" rx="3" stroke="#4f39f6" stroke-width="4"></rect>
+
+  <!-- Pantalla -->
+  <rect x="19" y="15" width="16" height="12" rx="1" fill="#4f39f6"></rect>
+
+  <!-- Indicador en pantalla -->
+  <path d="M23 19h8M23 23h5" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"></path>
+
+  <!-- Manguera -->
+  <path d="M42 17h5a5 5 0 0 1 5 5v18" stroke="#4f39f6" stroke-width="4" stroke-linecap="round"></path>
+
+  <!-- Pistola -->
+  <path d="M52 40v6a5 5 0 0 1-10 0v-8" stroke="#4f39f6" stroke-width="4" stroke-linecap="round"></path>
+
+  <!-- Base -->
+  <path d="M7 56h42" stroke="#4f39f6" stroke-width="4" stroke-linecap="round"></path>
+
+  <!-- Detalle central -->
+  <circle cx="27" cy="39" r="5" stroke="#4f39f6" stroke-width="4"></circle>
+</svg>
