@@ -17,10 +17,17 @@ export class IngresoDatosComponent {
   gasolinera = signal<string>('Costco');
   tipoCombustible = signal<string>('Gasolina');
 
+  showForm = signal(false);
   successMessage = signal<string>('');
   errorMessage = signal<string>('');
 
   constructor(private refuelService: RefuelService) {}
+
+  toggleForm() {
+    this.showForm.set(!this.showForm());
+    this.errorMessage.set('');
+    this.successMessage.set('');
+  }
 
   onPrecioChange(val: number | null) {
     this.precioPorLitro.set(val);
@@ -78,6 +85,7 @@ export class IngresoDatosComponent {
     }
 
     this.successMessage.set('¡Repostaje registrado correctamente!');
+    this.showForm.set(false);
 
     // Resetear formulario
     this.precioPorLitro.set(null);
